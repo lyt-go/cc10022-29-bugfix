@@ -26,20 +26,34 @@ class DataImportRuleService(BaseModuleService):
         rule = self.get_entry(rule_id)
         if not rule or rule.get("status") != "已生效":
             return {"ok": False, "reason": "入库规则不可用或未生效"}
-        mapped, failed, duped = 0, 0, 0
+        # 逐行真实分类：每条原始记录落入且仅落入成功/失败/重复之一
+        classifications: list[str] = []
+        seen: list[dict[str, Any]] = []
+        target_module = rule.get("实体模型", "entity_model")
         for record in raw_data:
             # 导入单条记录：执行字段映射与数据转换
             mapped_record = self._apply_field_mapping(record, rule)
             if mapped_record is None:
-                failed += 1
+                classifications.append("失败")
                 continue
-            # 校验字段完整性并导入到目标实体
-            target_module = rule.get("实体模型", "entity_model")
-            if self._record_exists(target_module, mapped_record):
-                duped += 1
+            # 校验字段完整性并导入到目标实体：目标库存量与本批已接收记录均判重
+            if self._record_exists(target_module, mapped_record) or any(
+                all(mapped_record.get(k) == item.get(k) for k in mapped_record)
+                for item in seen
+            ):
+                classifications.append("重复")
                 continue
-            mapped += 1
-        return {"total": len(raw_data), "imported": mapped, "failed": failed, "duplicated": duped}
+            seen.append(mapped_record)
+            classifications.append("成功")
+        # 三个计数来自同一份实际分类，对原始行互斥
+        return {
+            "ok": True,
+            "total": len(raw_data),
+            "imported": classifications.count("成功"),
+            "failed": classifications.count("失败"),
+            "duplicated": classifications.count("重复"),
+            "classifications": classifications,
+        }
 
     def _apply_field_mapping(self, record: dict[str, Any], rule: dict[str, Any]) -> dict[str, Any] | None:
         """解析字段映射规则，执行源字段到目标字段的转换和标准化。"""
@@ -58,9 +72,13 @@ class DataImportRuleService(BaseModuleService):
 
     def _record_exists(self, module: str, record: dict[str, Any]) -> bool:
         """校验目标实体中是否已存在相同记录，用于去重判断。"""
+        if not record:
+            return False
         rows = store.rows(module)
         for row in rows:
-            if all(record.get(k) == row.get(k) for k in record if k in row):
+            common_keys = [k for k in record if k in row]
+            # 至少一个共同字段才可比，避免空交集被误判为重复
+            if common_keys and all(record[k] == row[k] for k in common_keys):
                 return True
         return False
 

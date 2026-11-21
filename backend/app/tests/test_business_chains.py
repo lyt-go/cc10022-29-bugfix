@@ -1,4 +1,4 @@
-"""业务链路测试：验证主数据清洗与黄金记录平台的 6 条关键链路。"""
+"""业务链路测试：验证主数据清洗与黄金记录平台的 7 条关键链路。"""
 from __future__ import annotations
 
 import datetime
@@ -30,7 +30,7 @@ from app.services.mdm_dashboard import MdmDashboardService
 
 
 class TestBusinessChains:
-    """测试主数据清洗平台的 6 条关键业务链路。"""
+    """测试主数据清洗平台的 7 条关键业务链路。"""
 
     # ── 链路1: 来源系统→入库规则→批次导入→字段标准化清洗 ──
     def test_chain1_source_import_cleanse(self):
@@ -282,6 +282,102 @@ class TestBusinessChains:
         assert "golden_records" in summary
         assert "duplicate_clusters" in summary
 
+    # ── 链路7: 入库规则→批次导入→分片确认→台账核对 ──
+    def test_chain7_batch_count_confirmation(self):
+        """入库计数确认：三计数互斥同源、分片重送幂等、台账与整批确认数对得上。"""
+        rule_svc = DataImportRuleService()
+        batch_svc = ImportBatchService()
+
+        # 入库规则给出真实映射与校验分类（目标模型已有存量数据，
+        # 映射字段与存量行无交集时不应误判为重复）
+        rule, missing = rule_svc.create_entry({
+            "规则编号": "DATA-CHAIN7",
+            "来源系统": "CRM",
+            "实体模型": "golden_record",
+            "字段映射": "name->姓名,phone->电话",
+            "校验规则": "必填校验",
+            "出错策略": "拦截",
+            "分片大小": "50",
+            "规则版本": "v1",
+        })
+        assert not missing and rule is not None, f"入库规则登记失败: {missing}"
+        rule_svc.run_action(rule["id"], "提交校验")
+        rule_svc.run_action(rule["id"], "标记生效")
+        result = rule_svc.import_data_with_rules(rule["id"], [
+            {"name": "张三", "phone": "13800138000"},  # 合法
+            {"name": "李四", "phone": "13900139000"},  # 合法
+            {"name": "张三", "phone": "13800138000"},  # 本批内重复
+            {"email": "bad@example.com"},              # 坏字段：无映射源字段
+        ])
+        assert result["ok"] is True, f"规则导入应成功: {result}"
+        assert result["classifications"] == ["成功", "成功", "重复", "失败"]
+        assert (result["imported"], result["failed"], result["duplicated"]) == (2, 1, 1)
+        assert result["imported"] + result["failed"] + result["duplicated"] == result["total"]
+
+        # 批次三计数互斥，合计等于总记录数（100条：成功87、失败8、重复5）
+        batch = batch_svc.import_batch_from_source("CRM", "customer", 100)
+        counts = [int(batch["成功数"]), int(batch["失败数"]), int(batch["重复数"])]
+        assert sum(counts) == 100, f"三计数应互斥且合计为100: {counts}"
+        assert counts == [87, 8, 5], f"计数应来自同一份实际分类: {counts}"
+        integrity = batch_svc.validate_batch_integrity(batch["id"])
+        assert integrity["integrity_ok"] is True, f"完整性校验应通过: {integrity}"
+        assert integrity["ledger_ok"] is True, "台账分类应与批次计数一致"
+
+        # 分片确认：同一批两片不同进度，阶段确认数不写入整批正式统计
+        shard_batch, missing = batch_svc.create_entry({
+            "批次编号": "IMPO-CHAIN7",
+            "来源系统": "CRM",
+            "实体模型": "customer",
+            "总记录数": "6",
+            "成功数": "0",
+            "失败数": "0",
+            "重复数": "0",
+            "批次状态": "待处理",
+        })
+        assert not missing and shard_batch is not None
+        batch_id = shard_batch["id"]
+        shards = batch_svc.split_large_batch(batch_id, shard_size=3)
+        assert len(shards) == 2, f"6条按3切分应为2片: {len(shards)}"
+
+        # 第一片确认：已能识别重复
+        r1 = batch_svc.confirm_shard_import(batch_id, 1, ["成功", "重复", "成功"])
+        assert r1["ok"] and not r1["reused"] and not r1["finalized"]
+        progress = batch_svc.query_shard_progress(batch_id)
+        assert progress["confirmed_shards"] == 1
+        assert (progress["stage_success"], progress["stage_duplicate"]) == (2, 1)
+        current = batch_svc.get_entry(batch_id)
+        assert current["成功数"] == "0" and current["重复数"] == "0", \
+            "阶段确认数不能被当成整批正式统计"
+
+        # 第二片部分失败先补数：失败记录供值班联系供应商核对
+        r2_partial = batch_svc.confirm_shard_import(batch_id, 2, ["成功", "失败"])
+        assert r2_partial["ok"] and not r2_partial["confirmation"]["complete"]
+        errors = batch_svc.query_batch_errors(batch_id)
+        assert errors["failed_count"] == 1 and not errors["finalized"]
+
+        # 等待含合法、坏字段和重复值的入库完成，补数提交整片累计分类
+        r2 = batch_svc.confirm_shard_import(batch_id, 2, ["成功", "失败", "重复"])
+        assert r2["ok"] and r2["finalized"], "全部分片确认后应汇总正式计数"
+
+        # 重送已经确认过的第一片：沿用原确认结果，不重复入账
+        r1_again = batch_svc.confirm_shard_import(batch_id, 1, ["成功", "重复", "成功"])
+        assert r1_again["ok"] and r1_again["reused"], "已确认分片重送应沿用原确认结果"
+
+        # 台账既能回查实际分类，又与整批确认数对得上
+        final = batch_svc.get_entry(batch_id)
+        assert (final["成功数"], final["失败数"], final["重复数"]) == ("3", "1", "2")
+        ledger = final["ledger"]
+        assert len(ledger) == 6, f"重送后台账不应重复入账: {len(ledger)}"
+        assert sum(1 for item in ledger if item["category"] == "成功") == 3
+        assert sum(1 for item in ledger if item["category"] == "重复") == 2
+        integrity2 = batch_svc.validate_batch_integrity(batch_id)
+        assert integrity2["integrity_ok"] and integrity2["ledger_ok"]
+
+        # 汇总口径一致：全部批次的成功+失败+重复等于总记录数
+        summary = batch_svc.query_batch_summary()
+        assert (summary["total_success"] + summary["total_failed"]
+                + summary["total_duplicate"]) == summary["total_records"]
+
 
 if __name__ == "__main__":
     runner = TestBusinessChains()
@@ -292,6 +388,7 @@ if __name__ == "__main__":
         ("链路4: 清洗→优胜策略→版本快照", runner.test_chain4_survivorship_to_version),
         ("链路5: 黄金记录→查询接口→分发同步", runner.test_chain5_golden_to_sync),
         ("链路6: 参考数据→实体模型→质量统计→看板", runner.test_chain6_reference_to_dashboard),
+        ("链路7: 入库规则→批次导入→分片确认→台账核对", runner.test_chain7_batch_count_confirmation),
     ]
 
     passed = 0
